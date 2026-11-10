@@ -36,7 +36,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build Boston recovery
+    name: Build Boston TWRP Recovery
     runs-on: ubuntu-22.04
     timeout-minutes: 360
 
@@ -49,48 +49,55 @@ jobs:
       MANIFEST_BRANCH: ${{ inputs.MANIFEST_BRANCH }}
       DEVICE_TREE_URL: ${{ inputs.DEVICE_TREE_URL }}
       DEVICE_TREE_BRANCH: ${{ inputs.DEVICE_TREE_BRANCH }}
+
       DEVICE_PATH: device/motorola/boston
       DEVICE_NAME: boston
       LUNCH_TARGET: twrp_boston-eng
       BUILD_TARGET: recoveryimage
+
       RELEASE_TAG: boston-no-fbe-rolling
       USE_CCACHE: "0"
       ALLOW_MISSING_DEPENDENCIES: "true"
       LC_ALL: C
 
     steps:
-      - name: Check out workflow repository
+      - name: Checkout workflow repository
         uses: actions/checkout@v4
 
-      - name: Display configuration
+      - name: Display build configuration
         run: |
           set -euo pipefail
-          printf '%s
-' \
-            "Device: Motorola Moto G Stylus 5G 2024" \
-            "Model: XT2419-1" \
-            "Codename: $DEVICE_NAME" \
-            "Manifest: $MANIFEST_URL" \
-            "Manifest branch: $MANIFEST_BRANCH" \
-            "Device tree: $DEVICE_TREE_URL" \
-            "Device tree branch: $DEVICE_TREE_BRANCH" \
-            "Lunch target: $LUNCH_TARGET" \
-            "Build target: $BUILD_TARGET" \
-            "Recovery decryption: disabled"
+
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+
+          echo "Device: Motorola Moto G Stylus 5G 2024"
+          echo "Model: XT2419-1"
+          echo "Codename: Boston"
+          echo "Manifest: $MANIFEST_URL"
+          echo "Manifest branch: $MANIFEST_BRANCH"
+          echo "Device tree: $DEVICE_TREE_URL"
+          echo "Device tree branch: $DEVICE_TREE_BRANCH"
+          echo "Lunch target: $LUNCH_TARGET"
+          echo "Build target: $BUILD_TARGET"
+          echo "Recovery decryption support: not enabled by this workflow"
+
           df -h
           free -h
 
       - name: Free runner disk space
         run: |
           set -euo pipefail
+
           sudo rm -rf \
             /usr/share/dotnet \
             /usr/local/lib/android \
             /opt/ghc \
             /usr/local/.ghcup \
             /opt/hostedtoolcache/CodeQL
+
           docker image prune --all --force || true
           sudo apt-get clean
+
           df -h
 
       - name: Install build dependencies
@@ -98,7 +105,9 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           set -euo pipefail
+
           sudo apt-get update
+
           sudo apt-get install -y --no-install-recommends \
             bc \
             bison \
@@ -127,6 +136,7 @@ jobs:
             lzop \
             pngcrush \
             python3 \
+            python3-pip \
             python-is-python3 \
             rsync \
             schedtool \
@@ -135,7 +145,12 @@ jobs:
             wget \
             xsltproc \
             zip \
-            zlib1g-dev
+            zlib1g-dev \
+            libbz2-dev \
+            libffi-dev \
+            libreadline-dev \
+            libsqlite3-dev
+
           git lfs install
 
       - name: Set up Java
@@ -144,271 +159,285 @@ jobs:
           distribution: temurin
           java-version: "11"
 
+      - name: Install Python 2.7 compatibility
+        run: |
+          set -euo pipefail
+
+          cd /tmp
+
+          wget https://www.python.org/ftp/python/2.7.18/Python-2.7.18.tgz
+
+          tar -xzf Python-2.7.18.tgz
+
+          cd Python-2.7.18
+
+          ./configure \
+            --prefix=/usr/local \
+            --enable-unicode=ucs4
+
+          make -j2
+
+          sudo make altinstall
+
+          sudo ln -sf /usr/local/bin/python2.7 /usr/bin/python2.7
+
+          python2.7 --version
+          python3 --version
+
       - name: Configure swap
         run: |
           set -euo pipefail
+
           if ! swapon --show=NAME --noheadings | grep -qx /swapfile-boston; then
             sudo fallocate -l 12G /swapfile-boston
             sudo chmod 600 /swapfile-boston
             sudo mkswap /swapfile-boston
             sudo swapon /swapfile-boston
           fi
-          free -h
-          df -h
 
-      - name: Install repo tool
+          free -h
+
+      - name: Install Repo tool
         run: |
           set -euo pipefail
+
           mkdir -p "$HOME/bin"
-          curl --fail --location --retry 5 \
+
+          curl -fsSL \
             https://storage.googleapis.com/git-repo-downloads/repo \
-            --output "$HOME/bin/repo"
+            -o "$HOME/bin/repo"
+
           chmod +x "$HOME/bin/repo"
+
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
-      - name: Configure Git
-        run: |
-          set -euo pipefail
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
-          git config --global color.ui false
+          "$HOME/bin/repo" --version
 
-      - name: Initialize source
+      - name: Initialize TWRP source
         run: |
           set -euo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/workspace"
-          cd "$GITHUB_WORKSPACE/workspace"
+
+          mkdir -p "$GITHUB_WORKSPACE/android"
+
+          cd "$GITHUB_WORKSPACE/android"
+
+          git config --global user.name "Boston Recovery Builder"
+          git config --global user.email "actions@github.com"
+
           repo init \
-            --depth=1 \
-            --no-clone-bundle \
             -u "$MANIFEST_URL" \
-            -b "$MANIFEST_BRANCH"
+            -b "$MANIFEST_BRANCH" \
+            --depth=1
 
-      - name: Sync source
-        working-directory: workspace
+      - name: Sync TWRP source
         run: |
           set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE/android"
+
           repo sync \
             -c \
             --force-sync \
             --no-clone-bundle \
             --no-tags \
-            --optimized-fetch \
-            -j4
+            -j2
 
       - name: Clone Boston device tree
-        working-directory: workspace
         run: |
           set -euo pipefail
 
-          if [[ -e "$DEVICE_PATH" ]]; then
-            echo "::error::Device path already exists: $DEVICE_PATH"
-            exit 1
-          fi
+          cd "$GITHUB_WORKSPACE/android"
+
+          mkdir -p "$DEVICE_PATH"
 
           git clone \
             --depth=1 \
-            --single-branch \
             --branch "$DEVICE_TREE_BRANCH" \
             "$DEVICE_TREE_URL" \
             "$DEVICE_PATH"
 
-          git -C "$DEVICE_PATH" lfs pull
+          echo "Boston device tree installed."
 
-          test -f "$DEVICE_PATH/BoardConfig.mk"
-          test -f "$DEVICE_PATH/AndroidProducts.mk"
-          test -f "$DEVICE_PATH/twrp_boston.mk"
-
-          DEVICE_COMMIT="$(git -C "$DEVICE_PATH" rev-parse HEAD)"
-          echo "DEVICE_COMMIT=$DEVICE_COMMIT" >> "$GITHUB_ENV"
-
-      - name: Disable recovery crypto and FBE support
-        working-directory: workspace
+      - name: Install device tree dependencies
         run: |
           set -euo pipefail
 
-          python3 - <<'PY'
+          cd "$GITHUB_WORKSPACE/android"
+
+          DEPENDENCY_FILE="$DEVICE_PATH/twrp.dependencies"
+
+          if [ -f "$DEPENDENCY_FILE" ]; then
+            python3 - "$DEPENDENCY_FILE" <<'PY'
+          import json
           import os
-          import re
-          from pathlib import Path
+          import subprocess
+          import sys
 
-          board = Path(os.environ["DEVICE_PATH"]) / "BoardConfig.mk"
-          text = board.read_text()
+          with open(sys.argv[1], "r") as f:
+              dependencies = json.load(f)
 
-          settings = {
-              "TW_INCLUDE_CRYPTO": "false",
-              "TW_INCLUDE_CRYPTO_FBE": "false",
-              "TW_INCLUDE_FBE_METADATA_DECRYPT": "false",
-              "BOARD_USES_QCOM_FBE_DECRYPTION": "false",
-          }
+          for dep in dependencies:
+              remote = dep.get("remote")
+              repository = dep.get("repository")
+              branch = dep.get("branch")
+              target = dep.get("target_path")
 
-          for name in settings:
-              text = re.sub(
-                  rf"^[ \t]*{re.escape(name)}[ \t]*"
-                  rf"(?::=|?=|+=|=)[^
-]*(?:
-|$)",
-                  "",
-                  text,
-                  flags=re.MULTILINE,
-              )
+              if not repository or not target:
+                  raise SystemExit("Invalid dependency entry: " + str(dep))
 
-          text = re.sub(
-              r"^[ \t]*TW_USE_FSCRYPT_POLICY[ \t]*"
-              r"(?::=|?=|+=|=)[^
-]*(?:
-|$)",
-              "",
-              text,
-              flags=re.MULTILINE,
-          )
+              url = repository
 
-          text += "
-# CI build: recovery decryption disabled.
-"
-          text += "
-".join(
-              f"{name} := {value}"
-              for name, value in settings.items()
-          )
-          text += "
-"
-          board.write_text(text)
+              if remote and not url.startswith(("http://", "https://", "git@")):
+                  url = remote.rstrip("/") + "/" + repository
+
+              if not url.startswith(("http://", "https://", "git@")):
+                  url = "https://github.com/" + url
+
+              os.makedirs(os.path.dirname(target), exist_ok=True)
+
+              command = ["git", "clone", "--depth=1"]
+
+              if branch:
+                  command += ["--branch", branch]
+
+              command += [url, target]
+
+              subprocess.run(command, check=True)
+
+              print("Installed dependency:", target)
           PY
-
-          git -C "$DEVICE_PATH" diff -- BoardConfig.mk
-
-      - name: Record source manifest
-        working-directory: workspace
-        run: |
-          set -euo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          repo manifest -r \
-            -o "$GITHUB_WORKSPACE/artifacts/source-manifest.xml"
-
-      - name: Build recovery
-        working-directory: workspace
-        run: |
-          set -eo pipefail
-
-          # Android environment scripts may reference unset variables.
-          set +u
-          source build/envsetup.sh
-          lunch "$LUNCH_TARGET"
-
-          JOBS="$(nproc)"
-          if (( JOBS > 4 )); then
-            JOBS=4
+          else
+            echo "No twrp.dependencies file found."
           fi
 
-          make "$BUILD_TARGET" -j"$JOBS" 2>&1 \
-            | tee "$GITHUB_WORKSPACE/artifacts/build.log"
-
-      - name: Package recovery
+      - name: Verify Boston build configuration
         run: |
           set -euo pipefail
 
-          IMAGE="$GITHUB_WORKSPACE/workspace/out/target/product/boston/recovery.img"
-          OUTPUT="$GITHUB_WORKSPACE/artifacts"
+          cd "$GITHUB_WORKSPACE/android"
 
-          if [[ ! -s "$IMAGE" ]]; then
-            echo "::error::Expected recovery.img was not produced."
+          test -f "$DEVICE_PATH/Android.mk" || \
+            test -f "$DEVICE_PATH/Android.bp"
+
+          echo "Checking recovery configuration..."
+
+          find "$DEVICE_PATH" -maxdepth 2 \
+            -type f \
+            \( -name "BoardConfig.mk" \
+            -o -name "BoardConfigCommon.mk" \
+            -o -name "AndroidProducts.mk" \
+            -o -name "twrp_boston.mk" \
+            -o -name "omni_boston.mk" \) \
+            -print
+
+          echo "Device tree verification completed."
+
+      - name: Set up build environment
+        run: |
+          set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE/android"
+
+          source build/envsetup.sh
+
+          lunch "$LUNCH_TARGET"
+
+      - name: Build Boston recovery image
+        run: |
+          set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE/android"
+
+          source build/envsetup.sh
+
+          lunch "$LUNCH_TARGET"
+
+          mka "$BUILD_TARGET" -j2
+
+      - name: Locate recovery image
+        run: |
+          set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE/android"
+
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+
+          RECOVERY_IMAGE="$(find out/target/product/boston \
+            -type f \
+            -name recovery.img \
+            -print -quit)"
+
+          if [ -z "$RECOVERY_IMAGE" ]; then
+            echo "ERROR: recovery.img was not generated."
+            find out/target/product/boston -maxdepth 2 -type f || true
             exit 1
           fi
 
-          cp "$IMAGE" "$OUTPUT/twrp-boston-no-fbe.img"
+          cp "$RECOVERY_IMAGE" \
+            "$GITHUB_WORKSPACE/artifacts/recovery-boston.img"
 
-          (
-            cd "$OUTPUT"
-            sha256sum twrp-boston-no-fbe.img > SHA256SUMS
-          )
+          sha256sum \
+            "$GITHUB_WORKSPACE/artifacts/recovery-boston.img" \
+            > "$GITHUB_WORKSPACE/artifacts/SHA256SUMS.txt"
 
-          {
-            printf 'Device: Moto G Stylus 5G 2024
-'
-            printf 'Model: XT2419-1
-'
-            printf 'Codename: boston
-'
-            printf 'Manifest: %s
-' "$MANIFEST_URL"
-            printf 'Manifest branch: %s
-' "$MANIFEST_BRANCH"
-            printf 'Device tree: %s
-' "$DEVICE_TREE_URL"
-            printf 'Device tree branch: %s
-' "$DEVICE_TREE_BRANCH"
-            printf 'Device tree commit: %s
-' "$DEVICE_COMMIT"
-            printf 'Workflow commit: %s
-' "$GITHUB_SHA"
-            printf 'Run: %s
-' "$GITHUB_RUN_ID"
-            printf 'Recovery decryption support: disabled
-'
-            printf '
-This build does not disable encryption on the phone.
-'
-            printf 'Boot and firmware compatibility require device testing.
-'
-          } > "$OUTPUT/build-info.txt"
+          echo "Recovery image generated successfully."
 
-      - name: Upload build artifacts and logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: boston-no-fbe-${{ github.run_id }}
-          path: artifacts/
-          if-no-files-found: warn
-          retention-days: 14
-
-      - name: Publish rolling release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+      - name: Generate build information
         run: |
           set -euo pipefail
 
-          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
-          Experimental TWRP recovery build for:
-          - Motorola Moto G Stylus 5G (2024)
-          - Model: XT2419-1
-          - Codename: boston
-
-          Recovery crypto/FBE decryption support is disabled.
-          This does not remove or disable encryption on the phone.
-          Encrypted internal storage may remain inaccessible.
-
-          Device tree: $DEVICE_TREE_URL
-          Branch: $DEVICE_TREE_BRANCH
-          Device tree commit: $DEVICE_COMMIT
-
+          cat > "$GITHUB_WORKSPACE/artifacts/BUILD-INFO.txt" <<EOF
+          Device: Motorola Moto G Stylus 5G 2024
+          Model: XT2419-1
+          Codename: Boston
+          Recovery: TWRP
+          Android Base: 12.1
           Manifest: $MANIFEST_URL
-          Manifest branch: $MANIFEST_BRANCH
-
-          Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
-
-          Experimental: successful compilation does not prove boot compatibility.
-          Verify firmware compatibility before flashing.
+          Manifest Branch: $MANIFEST_BRANCH
+          Device Tree: $DEVICE_TREE_URL
+          Device Tree Branch: $DEVICE_TREE_BRANCH
+          Build Target: $BUILD_TARGET
+          Release: Rolling
+          Recovery Decryption: Not enabled by workflow
           EOF
 
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" \
-              --title "Boston TWRP — No FBE — Rolling" \
-              --notes-file "$RUNNER_TEMP/release-notes.md" \
-              --prerelease
-          else
-            gh release create "$RELEASE_TAG" \
-              --target "$GITHUB_SHA" \
-              --title "Boston TWRP — No FBE — Rolling" \
-              --notes-file "$RUNNER_TEMP/release-notes.md" \
-              --prerelease
-          fi
+      - name: Upload recovery artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Boston-TWRP-Recovery
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
 
-          gh release upload "$RELEASE_TAG" \
-            "$GITHUB_WORKSPACE/artifacts/twrp-boston-no-fbe.img" \
-            "$GITHUB_WORKSPACE/artifacts/SHA256SUMS" \
-            "$GITHUB_WORKSPACE/artifacts/build-info.txt" \
-            "$GITHUB_WORKSPACE/artifacts/source-manifest.xml" \
-            --clobber
+      - name: Publish rolling GitHub release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: boston-no-fbe-rolling
+          name: Boston Recovery - Rolling Release
+          body: |
+            Unofficial TWRP recovery build for Motorola Moto G Stylus 5G 2024.
+
+            Device: Boston
+            Model: XT2419-1
+            Android base: TWRP 12.1
+
+            Recovery image:
+            recovery-boston.img
+
+            Verify SHA256SUMS.txt before flashing.
+
+            IMPORTANT:
+            Check device compatibility and partition layout
+            before flashing this recovery.
+
+            Recovery decryption is not enabled by this workflow.
+          files: |
+            artifacts/recovery-boston.img
+            artifacts/SHA256SUMS.txt
+            artifacts/BUILD-INFO.txt
+          prerelease: true
+          make_latest: false
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
