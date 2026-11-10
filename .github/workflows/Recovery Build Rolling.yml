@@ -334,7 +334,9 @@ jobs:
 
       - name: Set up build environment
         run: |
-          set -euo pipefail
+          # Android's envsetup.sh and its functions expect unset variables
+          # to be allowed, so do not enable Bash nounset in this step.
+          set -eo pipefail
 
           cd "$GITHUB_WORKSPACE/android"
 
@@ -344,7 +346,8 @@ jobs:
 
       - name: Build Boston recovery image
         run: |
-          set -euo pipefail
+          # Android's build scripts may reference unset variables.
+          set -eo pipefail
 
           cd "$GITHUB_WORKSPACE/android"
 
